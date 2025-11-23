@@ -87,7 +87,7 @@ def save_seen_ids() -> None:
 
 
 # ==========================
-# SCRAPING
+# SCRAPING HELPERS
 # ==========================
 
 def fetch_settlement_links() -> List[str]:
@@ -117,6 +117,27 @@ def fetch_settlement_links() -> List[str]:
     return links
 
 
+def score_proof_answer(text: str) -> int:
+    """Score a proof answer: higher = more confident / specific."""
+    low = text.lower().strip()
+
+    # Strong "no" indicators
+    if any(kw in low for kw in ["not required", "none required", "no proof"]):
+        return 3
+    if low in ("no", "none"):
+        return 3
+
+    # Medium "maybe" indicator
+    if "may be required" in low:
+        return 2
+
+    # Plain required / yes
+    if "required" in low or low in ("yes", "y"):
+        return 1
+
+    return 0
+
+
 def normalize_proof_answer(text: str) -> str:
     """Normalize proof answer text into friendly Yes/No/Maybe sentences."""
     low = text.lower().strip()
@@ -130,6 +151,38 @@ def normalize_proof_answer(text: str) -> str:
         return "Yes, proof is required."
     # Fallback raw
     return text.strip()
+
+
+def is_bad_reward_heading(text: str) -> bool:
+    """
+    Return True if this 'reward' text is obviously just a heading/question,
+    not an actual payout line.
+    """
+    low = text.lower().strip()
+
+    # Question-style headings with no actual amount or variation keywords
+    if text.endswith("?"):
+        if "$" not in text and not any(k in low for k in ["varies", "pending", "tbd", "to be determined"]):
+            return True
+
+    # Common heading phrases that aren't payouts
+    bad_phrases = [
+        "who is eligible for a payout",
+        "who is eligible",
+        "who can file",
+        "who may qualify",
+        "what is this settlement",
+        "what is the",
+        "how do i file",
+        "how can i file",
+        "how to file",
+        "class members",
+        "who is included",
+    ]
+    if any(p in low for p in bad_phrases):
+        return True
+
+    return False
 
 
 def fetch_settlement_details(url: str) -> Dict:
@@ -176,9 +229,11 @@ def fetch_settlement_details(url: str) -> Dict:
 
     reward = None
     deadline = None
-    proof_value_on_same_line = None  # e.g. "Proof of Purchase: Required"
-    proof_heading_tag = None         # e.g. "Proof Required?"
     claim_url = None
+
+    # We'll collect proof candidates here
+    proof_same_line_candidates: List[str] = []  # "Proof required: No"
+    proof_heading_tags: List[BeautifulSoup] = []  # tags like "Proof Required?"
 
     # --------------------------
     # Reward / Deadline / Proof (first pass)
@@ -204,23 +259,25 @@ def fetch_settlement_details(url: str) -> Dict:
                     "settlement benefits",
                 ]
             ):
+                # candidate reward text
                 parts = text_full.split(":", 1)
-                reward = parts[1].strip() if len(parts) > 1 else text_full.strip()
+                candidate = parts[1].strip() if len(parts) > 1 else text_full.strip()
+                if not is_bad_reward_heading(candidate):
+                    reward = candidate
 
         # Deadline
         if deadline is None and "deadline" in lower:
             parts = text_full.split(":", 1)
             deadline = parts[1].strip() if len(parts) > 1 else text_full.strip()
 
-        # Proof detection:
+        # Proof detection
         if "proof" in lower:
-            # Pattern like: "Proof of Purchase: Required / Not Required"
-            if ":" in text_full and proof_value_on_same_line is None:
-                label, value = text_full.split(":", 1)
-                proof_value_on_same_line = value.strip()
-            # Heading like "Proof Required?" or "Proof of Purchase"
-            if proof_heading_tag is None:
-                proof_heading_tag = tag
+            if ":" in text_full:
+                # "Proof required: No"
+                proof_same_line_candidates.append(text_full)
+            else:
+                # Heading like "Proof Required?"
+                proof_heading_tags.append(tag)
 
     # Fallback for reward: dollar amount line mentioning payout/award/cash/etc.
     if reward is None:
@@ -232,6 +289,10 @@ def fetch_settlement_details(url: str) -> Dict:
             if any(word in low for word in ["award", "payment", "payout", "cash", "benefit"]):
                 reward = t
                 break
+
+    # If still nothing useful, set explicit "Not listed"
+    if reward is None:
+        reward = "Not listed"
 
     # --------------------------
     # Summary detection
@@ -283,23 +344,35 @@ def fetch_settlement_details(url: str) -> Dict:
     # --------------------------
     # Proof normalization
     # --------------------------
-    proof = None
+    proof_answer_text = None
+    best_score = -1
 
-    if proof_value_on_same_line:
-        # e.g. "Required", "Not Required", "None Required"
-        proof = normalize_proof_answer(proof_value_on_same_line)
+    # 1) Lines like "Proof required: No"
+    for line in proof_same_line_candidates:
+        val = line.split(":", 1)[1].strip() if ":" in line else line.strip()
+        s = score_proof_answer(val)
+        if s > best_score:
+            best_score = s
+            proof_answer_text = val
 
-    elif proof_heading_tag is not None:
-        # Look at the next non-empty sibling after the heading
-        sib = proof_heading_tag.find_next_sibling()
+    # 2) Headings like "Proof Required?" + next sibling answer
+    for heading in proof_heading_tags:
+        sib = heading.find_next_sibling()
         while sib is not None and not sib.get_text(" ", strip=True):
             sib = sib.find_next_sibling()
 
-        if sib is not None:
-            ans_text = sib.get_text(" ", strip=True)
-            proof = normalize_proof_answer(ans_text)
+        if sib is None:
+            continue
 
-    # If no structured info found, leave proof as None
+        val = sib.get_text(" ", strip=True)
+        s = score_proof_answer(val)
+        if s > best_score:
+            best_score = s
+            proof_answer_text = val
+
+    proof = None
+    if proof_answer_text:
+        proof = normalize_proof_answer(proof_answer_text)
 
     # --------------------------
     # Claim button URL
@@ -336,7 +409,7 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
     """
     title = data.get("title") or "Class Action Settlement"
     claim_url = data.get("claim_url")
-    reward = data.get("reward")
+    reward = data.get("reward") or "Not listed"
     deadline = data.get("deadline")
     summary = data.get("summary")
     proof = data.get("proof")
@@ -362,8 +435,8 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
         color=0x00AAFF,
     )
 
-    if reward:
-        embed.add_field(name="Reward", value=reward, inline=False)
+    # Reward always shown, even if "Not listed"
+    embed.add_field(name="Reward", value=reward, inline=False)
 
     if deadline:
         embed.add_field(name="Deadline", value=deadline, inline=False)
