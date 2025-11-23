@@ -45,20 +45,23 @@ if not DISCORD_TOKEN:
 if not CHANNEL_ID:
     raise SystemExit("ERROR: DISCORD_CHANNEL_ID_OPENCLASS not set")
 
-CHANNEL_ID = int(CHANNEL_ID)
+try:
+    CHANNEL_ID = int(CHANNEL_ID)
+except ValueError:
+    raise SystemExit("ERROR: DISCORD_CHANNEL_ID_OPENCLASS must be an integer")
 
 intents = discord.Intents.default()
 intents.message_content = True  # for !oca_test
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-seen_ids = set()
+seen_ids: set[str] = set()
 
 # ==========================
 # SEEN IDS
 # ==========================
 
-def load_seen_ids():
+def load_seen_ids() -> None:
     global seen_ids
     if os.path.exists(SEEN_FILE):
         try:
@@ -74,7 +77,7 @@ def load_seen_ids():
         print("[OCA] No seen file, starting fresh")
 
 
-def save_seen_ids():
+def save_seen_ids() -> None:
     try:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump({"seen_ids": sorted(list(seen_ids))}, f, indent=2)
@@ -120,7 +123,7 @@ def fetch_settlement_details(url: str) -> Dict:
     - Title
     - Reward (Settlement Award)
     - Deadline
-    - Summary (skipping Steve/boilerplate)
+    - Summary (cleaned)
     - Proof required info
     - Claim URL (Submit Claim button)
     """
@@ -150,17 +153,20 @@ def fetch_settlement_details(url: str) -> Dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
+    # --------------------------
     # Title
+    # --------------------------
     h1 = soup.find("h1")
     title = h1.get_text(strip=True) if h1 else "Class Action Settlement"
 
     reward = None
     deadline = None
-    proof = None
-    summary = None
+    proof_raw = None
     claim_url = None
 
-    # Award / deadline / proof
+    # --------------------------
+    # Reward / Deadline / Proof
+    # --------------------------
     for tag in soup.find_all(["h2", "h3", "h4", "strong", "p", "li"]):
         text_full = tag.get_text(" ", strip=True)
         if not text_full:
@@ -178,12 +184,16 @@ def fetch_settlement_details(url: str) -> Dict:
             parts = text_full.split(":", 1)
             deadline = parts[1].strip() if len(parts) > 1 else text_full.strip()
 
-        # Proof required
-        if proof is None and ("proof of purchase" in lower or "proof required" in lower):
-            parts = text_full.split(":", 1)
-            proof = parts[1].strip() if len(parts) > 1 else text_full.strip()
+        # Proof required line
+        if proof_raw is None and "proof" in lower:
+            proof_raw = text_full
 
-    # Summary: first decent paragraph, skipping boilerplate & "Steve" author text
+    # --------------------------
+    # Improved summary detection
+    # --------------------------
+    summary: str | None = None
+    backup_summary: str | None = None
+
     for p in soup.find_all("p"):
         txt = p.get_text(" ", strip=True)
         if not txt:
@@ -191,20 +201,59 @@ def fetch_settlement_details(url: str) -> Dict:
 
         low = txt.lower()
 
-        # Skip site boilerplate
+        # Skip boilerplate
         if "openclassactions.com is a news site providing information" in low:
             continue
         if "class action claims are submitted under penalty of perjury" in low:
             continue
 
-        # Skip author/Steve lines
+        # Skip Steve author stuff
         if " steve " in low or low.startswith("steve ") or low.startswith("by steve"):
             continue
 
-        summary = txt
-        break
+        # Skip PDF viewer messages
+        if "browser does not support viewing pdfs inline" in low:
+            continue
+        if "download the pdf" in low:
+            continue
 
-    # Claim button
+        # Skip big step/bullet lists as primary summary
+        if "step 1" in low or "step 2" in low or " • " in txt:
+            # keep as backup if nothing better
+            if backup_summary is None:
+                backup_summary = txt
+            continue
+
+        # Prefer a nice medium/long descriptive paragraph
+        if len(txt) > 80:
+            summary = txt
+            break
+
+        # Short but non-trash paragraph – keep as backup if we don't find better
+        if backup_summary is None:
+            backup_summary = txt
+
+    if summary is None:
+        summary = backup_summary
+
+    # --------------------------
+    # Improved proof normalization
+    # --------------------------
+    proof: str | None = None
+    if proof_raw:
+        low = proof_raw.lower()
+        if "not required" in low or "none required" in low:
+            proof = "No, proof is not required."
+        elif "may be required" in low:
+            proof = "Proof may be required."
+        elif "required" in low:
+            proof = "Yes, proof is required."
+        else:
+            proof = proof_raw
+
+    # --------------------------
+    # Claim button URL
+    # --------------------------
     for tag in soup.find_all(["a", "button"]):
         text_btn = tag.get_text(" ", strip=True).lower()
         if "submit claim" in text_btn:
@@ -228,7 +277,7 @@ def fetch_settlement_details(url: str) -> Dict:
 # EMBED SENDER
 # ==========================
 
-async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict):
+async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) -> None:
     """
     Build and send the embed:
     - Title links ONLY to the claim URL (if any)
@@ -242,7 +291,7 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict):
     summary = data.get("summary")
     proof = data.get("proof")
 
-    # Title links ONLY to claim URL. If none, it's not clickable.
+    # Title links ONLY to claim URL. If none, it's just plain text (no OCA link).
     primary_link = claim_url if claim_url else None
 
     description_lines: List[str] = []
@@ -259,7 +308,7 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict):
 
     embed = discord.Embed(
         title=title,
-        url=primary_link,  # no OCA link ever
+        url=primary_link,
         description="\n".join(description_lines),
         color=0x00AAFF,
     )
@@ -344,7 +393,7 @@ async def oca_test(ctx: commands.Context):
         "reward": "$10 – $100 (example)",
         "deadline": "January 1, 2026",
         "summary": "This is a test settlement to confirm embed formatting.",
-        "proof": "Proof of purchase may be required. See claim form for details.",
+        "proof": "Yes, proof is required.",
         "claim_url": "https://example.com/claim",
     }
 
