@@ -57,7 +57,7 @@ try:
 except ValueError:
     raise SystemExit("ERROR: DISCORD_CHANNEL_ID_OPENCLASS must be an integer.")
 
-# Intents – keep it simple: only ask for message_content (for !oca_test).
+# Intents – only ask for message_content so !oca_test works.
 # Make sure "Message Content Intent" is enabled in the Developer Portal.
 intents = discord.Intents.default()
 intents.message_content = True
@@ -140,6 +140,7 @@ def fetch_settlement_details(url: str) -> Dict:
     """
     Given a single settlement URL, fetch useful details for the embed.
     Defensive so one bad page doesn't kill the loop.
+    Also tries to grab the 'Submit Claim' button URL.
     """
     print(f"[OCA] Fetching settlement page: {url}")
 
@@ -164,6 +165,7 @@ def fetch_settlement_details(url: str) -> Dict:
             "award": None,
             "deadline": None,
             "summary": None,
+            "claim_url": None,
         }
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -174,6 +176,7 @@ def fetch_settlement_details(url: str) -> Dict:
 
     award = None
     deadline = None
+    claim_url = None
 
     # Look for "Settlement Award" and "Deadline" in various tags
     for tag in soup.find_all(["h2", "h3", "h4", "strong", "p", "li"]):
@@ -210,6 +213,15 @@ def fetch_settlement_details(url: str) -> Dict:
         summary = txt
         break
 
+    # Try to find the "Submit Claim" button/link (purple text)
+    for tag in soup.find_all(["a", "button"]):
+        text = tag.get_text(" ", strip=True).lower()
+        if "submit claim" in text:
+            href = tag.get("href")
+            if href:
+                claim_url = urljoin(url, href)
+                break
+
     return {
         "id": url,       # Using URL as unique ID is enough
         "title": title,
@@ -217,19 +229,21 @@ def fetch_settlement_details(url: str) -> Dict:
         "award": award,
         "deadline": deadline,
         "summary": summary,
+        "claim_url": claim_url,
     }
 
 
 async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) -> None:
     """
     Build and send a Discord embed for a single settlement.
-    Includes your disclaimer and no source branding.
+    Includes your disclaimer and 'Submit Claim' link if available.
     """
     title = data.get("title") or "Class Action Settlement"
     url = data.get("url")
     award = data.get("award")
     deadline = data.get("deadline")
     summary = data.get("summary")
+    claim_url = data.get("claim_url")
 
     description_lines: List[str] = []
 
@@ -252,7 +266,7 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
 
     embed = discord.Embed(
         title=title,
-        url=url,
+        url=url,  # main settlement info page
         description="\n".join(description_lines),
         color=0x00AAFF,
     )
@@ -263,7 +277,13 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
     if deadline:
         embed.add_field(name="Deadline", value=deadline, inline=False)
 
-    # No explicit source footer
+    if claim_url:
+        embed.add_field(
+            name="Submit Claim",
+            value=f"[Click here to go to the official claim form]({claim_url})",
+            inline=False,
+        )
+
     await channel.send(embed=embed)
 
 
@@ -354,6 +374,7 @@ async def oca_test(ctx: commands.Context):
             "This is just a test settlement to confirm that the bot can "
             "post embeds correctly in this channel."
         ),
+        "claim_url": "https://www.example.com/submit-claim",
     }
     await send_settlement_embed(ctx.channel, dummy)
 
