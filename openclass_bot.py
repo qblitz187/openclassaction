@@ -1,8 +1,11 @@
-import os
+mport os
 import json
 import asyncio
-import requests
+import random
+import time
+from typing import Dict, List
 
+import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
@@ -10,20 +13,34 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-# ---------------------------
-# Config / Globals
-# ---------------------------
+# ==========================
+# CONFIG
+# ==========================
 
 SETTLEMENTS_INDEX_URL = "https://www.openclassactions.com/settlements.php"
 SEEN_FILE = "openclass_seen.json"
 
+# How often to check the site for new settlements
+CHECK_INTERVAL_MINUTES = 60  # every 60 minutes
+
+# How long to wait between posting individual settlements
+POST_INTERVAL_SECONDS = 10  # 10 seconds between posts
+
+# Hard cap on how many NEW settlements to post per run (protects from spam)
+MAX_POSTS_PER_RUN = 30
+
+# HTTP headers to look more like a normal browser
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Load .env for local dev; on Railway, env vars come from the service config
+# ==========================
+# ENV / DISCORD SETUP
+# ==========================
+
+# Load .env for local dev. On Railway the vars come from its UI.
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN_OPENCLASS")
@@ -38,19 +55,27 @@ if not CHANNEL_ID:
 try:
     CHANNEL_ID = int(CHANNEL_ID)
 except ValueError:
-    raise SystemExit("ERROR: DISCORD_CHANNEL_ID_OPENCLASS must be an integer")
+    raise SystemExit("ERROR: DISCORD_CHANNEL_ID_OPENCLASS must be an integer.")
 
+# Intents
 intents = discord.Intents.default()
+# Good practice for command bots:
+intents.message_content = True
+intents.members = True
+intents.presences = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Seen IDs cache
 seen_ids = set()
 
 
-# ---------------------------
-# Seen IDs persistence
-# ---------------------------
+# ==========================
+# SEEN IDS PERSISTENCE
+# ==========================
 
-def load_seen_ids():
+def load_seen_ids() -> None:
+    """Load already-posted settlement IDs from disk."""
     global seen_ids
     if os.path.exists(SEEN_FILE):
         try:
@@ -66,7 +91,8 @@ def load_seen_ids():
         print(f"[OCA] No {SEEN_FILE} found. Starting with an empty seen list.")
 
 
-def save_seen_ids():
+def save_seen_ids() -> None:
+    """Persist the seen IDs to disk (Railway volume or ephemeral fs)."""
     try:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump({"seen_ids": sorted(list(seen_ids))}, f, indent=2)
@@ -75,16 +101,17 @@ def save_seen_ids():
         print(f"[OCA] Failed to save {SEEN_FILE}: {e}")
 
 
-# ---------------------------
-# Scraping helpers
-# ---------------------------
+# ==========================
+# SCRAPING HELPERS
+# ==========================
 
-def fetch_settlement_links():
+def fetch_settlement_links() -> List[str]:
     """
     Grab all settlement detail URLs from the settlements index page.
     Returns a list of absolute URLs.
     """
     print("[OCA] Fetching settlements index...")
+
     try:
         resp = requests.get(
             SETTLEMENTS_INDEX_URL,
@@ -107,21 +134,28 @@ def fetch_settlement_links():
             if full_url not in links:
                 links.append(full_url)
 
-    print(f"[OCA] Found {len(links)} settlement links.")
+    print(f"[OCA] Found {len(links)} settlement links on index.")
     return links
 
 
-def fetch_settlement_details(url: str):
+def fetch_settlement_details(url: str) -> Dict:
     """
     Given a single settlement URL, fetch useful details for the embed.
+    We keep this fairly defensive so if one page is weird, it doesn't kill the loop.
     """
     print(f"[OCA] Fetching settlement page: {url}")
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": SETTLEMENTS_INDEX_URL,
+    }
+
     try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=20,
-        )
+        # small random sleep so we don't hammer them instantly
+        time.sleep(random.uniform(0.8, 1.6))
+
+        resp = requests.get(url, headers=headers, timeout=25)
         resp.raise_for_status()
     except Exception as e:
         print(f"[OCA] Error fetching {url}: {e}")
@@ -143,7 +177,7 @@ def fetch_settlement_details(url: str):
     award = None
     deadline = None
 
-    # Look through various tags for "Settlement Award:" and "Deadline:"
+    # Look for "Settlement Award" and "Deadline" in various tags
     for tag in soup.find_all(["h2", "h3", "h4", "strong", "p", "li"]):
         text = tag.get_text(" ", strip=True)
         if not text:
@@ -162,21 +196,24 @@ def fetch_settlement_details(url: str):
         if award and deadline:
             break
 
-    # Try to grab a reasonable first paragraph as a summary (skip disclaimers)
+    # Try to grab a reasonable first paragraph as a summary (skip boilerplate)
     summary = None
     for p in soup.find_all("p"):
         txt = p.get_text(" ", strip=True)
         if not txt:
             continue
+
+        # Skip the usual disclaimer text blocks they use on many pages
         if "OpenClassActions.com is a news site providing information" in txt:
             continue
         if "Class action claims are submitted under penalty of perjury" in txt:
             continue
+
         summary = txt
         break
 
     return {
-        "id": url,       # Use URL as unique ID
+        "id": url,       # Using URL as unique ID is enough
         "title": title,
         "url": url,
         "award": award,
@@ -185,9 +222,10 @@ def fetch_settlement_details(url: str):
     }
 
 
-async def send_settlement_embed(channel: discord.abc.Messageable, data: dict):
+async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) -> None:
     """
     Build and send a Discord embed for a single settlement.
+    Includes your legal/ethical disclaimer and NO explicit source branding.
     """
     title = data.get("title") or "Class Action Settlement"
     url = data.get("url")
@@ -196,15 +234,23 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: dict):
     summary = data.get("summary")
 
     description_lines = []
+
     if summary:
+        # Limit length so it doesn't get insane
         if len(summary) > 500:
             summary = summary[:497] + "..."
         description_lines.append(summary)
 
-    if not description_lines:
-        description_lines.append(
-            "New class action settlement listed on OpenClassActions.com."
-        )
+    # Your disclaimer (what you asked for)
+    disclaimer = (
+        "⚠️ Apply for these at your own risk, and only if you were "
+        "actually and legally affected by the issue. Do not submit false claims."
+    )
+
+    if description_lines:
+        description_lines.append("")  # blank line before disclaimer
+
+    description_lines.append(disclaimer)
 
     embed = discord.Embed(
         title=title,
@@ -219,17 +265,24 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: dict):
     if deadline:
         embed.add_field(name="Deadline", value=deadline, inline=False)
 
-    embed.set_footer(text="Source: OpenClassActions.com")
+    # No explicit source footer
+    # embed.set_footer(text="Source: OpenClassActions.com")
 
     await channel.send(embed=embed)
 
 
-# ---------------------------
-# Background task
-# ---------------------------
+# ==========================
+# BACKGROUND TASK
+# ==========================
 
-@tasks.loop(minutes=60)  # check every hour; tweak if needed
+@tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
 async def check_settlements():
+    """
+    Periodic task that:
+    - Fetches index
+    - Filters out seen URLs
+    - Posts up to MAX_POSTS_PER_RUN new settlements with spacing
+    """
     await bot.wait_until_ready()
     channel = bot.get_channel(CHANNEL_ID)
 
@@ -251,9 +304,13 @@ async def check_settlements():
         print("[OCA] No new settlements to post this cycle.")
         return
 
-    print(f"[OCA] Found {len(new_links)} new settlements to post.")
+    print(f"[OCA] Found {len(new_links)} new settlements to post this run.")
 
-    for url in new_links:
+    # Sort for stable ordering and cap the number per run
+    new_links = sorted(new_links)[:MAX_POSTS_PER_RUN]
+
+    for i, url in enumerate(new_links, start=1):
+        print(f"[OCA] Posting {i}/{len(new_links)}: {url}")
         details = fetch_settlement_details(url)
         await send_settlement_embed(channel, details)
 
@@ -261,13 +318,14 @@ async def check_settlements():
         seen_ids.add(details["id"])
         save_seen_ids()
 
-        # Space out posts (2 minutes between each)
-        await asyncio.sleep(120)
+        # Space out posts
+        if i < len(new_links):
+            await asyncio.sleep(POST_INTERVAL_SECONDS)
 
 
-# ---------------------------
-# Bot events / commands
-# ---------------------------
+# ==========================
+# BOT EVENTS / COMMANDS
+# ==========================
 
 @bot.event
 async def on_ready():
@@ -276,16 +334,19 @@ async def on_ready():
     load_seen_ids()
 
     if not check_settlements.is_running():
-        print("[OCA] Starting background task: check_settlements")
+        print(
+            f"[OCA] Starting background task: check_settlements "
+            f"every {CHECK_INTERVAL_MINUTES} minutes"
+        )
         check_settlements.start()
 
 
 @bot.command(name="oca_test")
-async def oca_test(ctx):
+async def oca_test(ctx: commands.Context):
     """
     Simple command to make sure the bot can talk and send an embed.
     """
-    await ctx.send("OpenClassActions bot is online and ready!")
+    await ctx.send("FH Settlements Bot is online and ready!")
 
     dummy = {
         "id": "test",
@@ -293,14 +354,17 @@ async def oca_test(ctx):
         "url": "https://www.openclassactions.com/",
         "award": "$10 - $100 (example)",
         "deadline": "Example Deadline",
-        "summary": "This is just a test embed to confirm that the bot can post to this channel.",
+        "summary": (
+            "This is just a test settlement to confirm that the bot can "
+            "post embeds correctly in this channel."
+        ),
     }
     await send_settlement_embed(ctx.channel, dummy)
 
 
-# ---------------------------
-# Run the bot
-# ---------------------------
+# ==========================
+# RUN
+# ==========================
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
