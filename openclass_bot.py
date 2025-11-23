@@ -55,7 +55,7 @@ intents.message_content = True  # for !oca_test
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-seen_ids: set[str] = set()
+seen_ids = set()
 
 # ==========================
 # SEEN IDS
@@ -121,7 +121,7 @@ def fetch_settlement_details(url: str) -> Dict:
     """
     Scrape a single settlement page:
     - Title
-    - Reward (Settlement Award)
+    - Reward (Settlement Award / Estimated Award / etc.)
     - Deadline
     - Summary (cleaned)
     - Proof required info
@@ -174,10 +174,22 @@ def fetch_settlement_details(url: str) -> Dict:
 
         lower = text_full.lower()
 
-        # Reward (Settlement Award)
-        if reward is None and "settlement award" in lower:
-            parts = text_full.split(":", 1)
-            reward = parts[1].strip() if len(parts) > 1 else text_full.strip()
+        # Reward / payout info – handle more phrasings
+        if reward is None:
+            if any(
+                key in lower
+                for key in [
+                    "settlement award",
+                    "estimated award",
+                    "cash payment",
+                    "payment amount",
+                    "payout",
+                    "benefit amount",
+                    "settlement benefits",
+                ]
+            ):
+                parts = text_full.split(":", 1)
+                reward = parts[1].strip() if len(parts) > 1 else text_full.strip()
 
         # Deadline
         if deadline is None and "deadline" in lower:
@@ -188,11 +200,22 @@ def fetch_settlement_details(url: str) -> Dict:
         if proof_raw is None and "proof" in lower:
             proof_raw = text_full
 
+    # Fallback for reward: dollar amount line mentioning payout/award/cash/etc.
+    if reward is None:
+        for tag in soup.find_all(["p", "li", "strong"]):
+            t = tag.get_text(" ", strip=True)
+            low = t.lower()
+            if "$" not in t:
+                continue
+            if any(word in low for word in ["award", "payment", "payout", "cash", "benefit"]):
+                reward = t
+                break
+
     # --------------------------
     # Improved summary detection
     # --------------------------
-    summary: str | None = None
-    backup_summary: str | None = None
+    summary = None
+    backup_summary = None
 
     for p in soup.find_all("p"):
         txt = p.get_text(" ", strip=True)
@@ -219,17 +242,16 @@ def fetch_settlement_details(url: str) -> Dict:
 
         # Skip big step/bullet lists as primary summary
         if "step 1" in low or "step 2" in low or " • " in txt:
-            # keep as backup if nothing better
             if backup_summary is None:
                 backup_summary = txt
             continue
 
-        # Prefer a nice medium/long descriptive paragraph
+        # Prefer a nice descriptive paragraph
         if len(txt) > 80:
             summary = txt
             break
 
-        # Short but non-trash paragraph – keep as backup if we don't find better
+        # Short but maybe still useful – backup
         if backup_summary is None:
             backup_summary = txt
 
@@ -239,7 +261,7 @@ def fetch_settlement_details(url: str) -> Dict:
     # --------------------------
     # Improved proof normalization
     # --------------------------
-    proof: str | None = None
+    proof = None
     if proof_raw:
         low = proof_raw.lower()
         if "not required" in low or "none required" in low:
@@ -291,7 +313,7 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
     summary = data.get("summary")
     proof = data.get("proof")
 
-    # Title links ONLY to claim URL. If none, it's just plain text (no OCA link).
+    # Title links ONLY to claim URL. If none, it's just plain text.
     primary_link = claim_url if claim_url else None
 
     description_lines: List[str] = []
