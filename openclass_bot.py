@@ -237,13 +237,14 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
     """
     Build and send a Discord embed for a single settlement.
     Includes your disclaimer and 'Submit Claim' link if available.
+    Title links to claim URL when present, otherwise to OCA page.
     """
     title = data.get("title") or "Class Action Settlement"
-    url = data.get("url")
+    url = data.get("url")           # OpenClassActions page
     award = data.get("award")
     deadline = data.get("deadline")
     summary = data.get("summary")
-    claim_url = data.get("claim_url")
+    claim_url = data.get("claim_url")  # actual claim form
 
     description_lines: List[str] = []
 
@@ -264,9 +265,13 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
 
     description_lines.append(disclaimer)
 
+    # Decide what the title link should be:
+    # Prefer claim_url (actual form). If missing, fall back to OCA URL.
+    primary_link = claim_url or url
+
     embed = discord.Embed(
         title=title,
-        url=url,  # main settlement info page
+        url=primary_link,
         description="\n".join(description_lines),
         color=0x00AAFF,
     )
@@ -277,10 +282,19 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
     if deadline:
         embed.add_field(name="Deadline", value=deadline, inline=False)
 
+    # Show the claim link explicitly if available
     if claim_url:
         embed.add_field(
             name="Submit Claim",
-            value=f"[Click here to go to the official claim form]({claim_url})",
+            value=f"[Go to the official claim form]({claim_url})",
+            inline=False,
+        )
+
+    # Also expose the OCA info page separately if it's different
+    if url and url != claim_url:
+        embed.add_field(
+            name="More Info",
+            value=f"[View settlement info page]({url})",
             inline=False,
         )
 
