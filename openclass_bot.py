@@ -3,7 +3,8 @@ import json
 import asyncio
 import random
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,9 +21,12 @@ from dotenv import load_dotenv
 SETTLEMENTS_INDEX_URL = "https://www.openclassactions.com/settlements.php"
 SEEN_FILE = "openclass_seen.json"
 
-CHECK_INTERVAL_MINUTES = 60
-POST_INTERVAL_SECONDS = 10
-MAX_POSTS_PER_RUN = 30
+# Base / max intervals for smart scheduling
+BASE_INTERVAL_MINUTES = 60          # default when new stuff is found
+MAX_INTERVAL_MINUTES = 180          # cap when nothing new for a while
+
+POST_INTERVAL_SECONDS = 10          # spacing between posts
+MAX_POSTS_PER_RUN = 30              # cap per scan
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -51,11 +55,15 @@ except ValueError:
     raise SystemExit("ERROR: DISCORD_CHANNEL_ID_OPENCLASS must be an integer")
 
 intents = discord.Intents.default()
-intents.message_content = True  # for !oca_test
+intents.message_content = True  # for !oca_test, !oca_next, !oca_info
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 seen_ids = set()
+
+# Smart scheduling state
+CURRENT_INTERVAL_MINUTES = BASE_INTERVAL_MINUTES
+last_scan_time: Optional[datetime] = None
 
 # ==========================
 # SEEN IDS
@@ -185,6 +193,37 @@ def is_bad_reward_heading(text: str) -> bool:
     return False
 
 
+def simplify_summary(text: str) -> str:
+    """
+    Simple one-sentence-ish cleanup:
+    - Take first sentence (or first ~220 chars)
+    - Strip extra whitespace
+    - Avoid cutting mid-word ugly
+    """
+    if not text:
+        return text
+
+    raw = " ".join(text.split())  # collapse whitespace
+
+    # Try first sentence by punctuation
+    for sep in [". ", "? ", "! "]:
+        if sep in raw:
+            first = raw.split(sep, 1)[0].strip()
+            if len(first) > 40:  # don't return super-short junk
+                return first + sep.strip()
+
+    # Fallback: truncate softly to ~220 chars
+    if len(raw) <= 220:
+        return raw
+
+    cut = raw[:220]
+    # Try to cut on last space before the end
+    last_space = cut.rfind(" ")
+    if last_space > 80:
+        cut = cut[:last_space]
+    return cut + "..."
+
+
 def fetch_settlement_details(url: str) -> Dict:
     """
     Scrape a single settlement page:
@@ -212,7 +251,7 @@ def fetch_settlement_details(url: str) -> Dict:
         return {
             "id": url,
             "title": "Class Action Settlement",
-            "reward": None,
+            "reward": "Not listed",
             "deadline": None,
             "summary": None,
             "proof": None,
@@ -259,7 +298,6 @@ def fetch_settlement_details(url: str) -> Dict:
                     "settlement benefits",
                 ]
             ):
-                # candidate reward text
                 parts = text_full.split(":", 1)
                 candidate = parts[1].strip() if len(parts) > 1 else text_full.strip()
                 if not is_bad_reward_heading(candidate):
@@ -297,7 +335,7 @@ def fetch_settlement_details(url: str) -> Dict:
     # --------------------------
     # Summary detection
     # --------------------------
-    summary = None
+    full_summary = None
     backup_summary = None
 
     for p in soup.find_all("p"):
@@ -331,15 +369,17 @@ def fetch_settlement_details(url: str) -> Dict:
 
         # Prefer a nice descriptive paragraph
         if len(txt) > 80:
-            summary = txt
+            full_summary = txt
             break
 
         # Short but maybe still useful – backup
         if backup_summary is None:
             backup_summary = txt
 
-    if summary is None:
-        summary = backup_summary
+    if full_summary is None:
+        full_summary = backup_summary
+
+    cleaned_summary = simplify_summary(full_summary) if full_summary else None
 
     # --------------------------
     # Proof normalization
@@ -390,7 +430,7 @@ def fetch_settlement_details(url: str) -> Dict:
         "title": title,
         "reward": reward,
         "deadline": deadline,
-        "summary": summary,
+        "summary": cleaned_summary,
         "proof": proof,
         "claim_url": claim_url,
     }
@@ -419,8 +459,6 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
     description_lines: List[str] = []
 
     if summary:
-        if len(summary) > 500:
-            summary = summary[:497] + "..."
         description_lines.append(summary)
 
     description_lines.append("")
@@ -455,42 +493,104 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
 
 
 # ==========================
-# BACKGROUND LOOP
+# CORE SCAN FUNCTION
 # ==========================
 
-@tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
-async def check_settlements():
-    await bot.wait_until_ready()
-    channel = bot.get_channel(CHANNEL_ID)
+async def run_settlement_scan(
+    target_channel: Optional[discord.abc.Messageable] = None,
+    max_posts: Optional[int] = None,
+) -> int:
+    """
+    Core logic to:
+    - Fetch index
+    - Filter out seen URLs
+    - Post up to max_posts new settlements
+    Returns number of new settlements posted.
+    """
+    channel = target_channel or bot.get_channel(CHANNEL_ID)
 
     if channel is None:
-        print("[OCA] Channel not found")
-        return
+        print("[OCA] ERROR: Channel not found")
+        return 0
 
     links = fetch_settlement_links()
     if not links:
         print("[OCA] No links fetched")
-        return
+        return 0
 
     global seen_ids
+
     new_links = [u for u in links if u not in seen_ids]
-
     if not new_links:
-        print("[OCA] No new settlements")
-        return
+        print("[OCA] No new settlements to post")
+        return 0
 
-    new_links = sorted(new_links)[:MAX_POSTS_PER_RUN]
+    new_links = sorted(new_links)
+    if max_posts is None:
+        max_posts = MAX_POSTS_PER_RUN
+    new_links = new_links[:max_posts]
+
     print(f"[OCA] Posting {len(new_links)} new settlements")
 
+    count = 0
     for i, url in enumerate(new_links, start=1):
         details = fetch_settlement_details(url)
         await send_settlement_embed(channel, details)
 
         seen_ids.add(details["id"])
         save_seen_ids()
+        count += 1
 
         if i < len(new_links):
             await asyncio.sleep(POST_INTERVAL_SECONDS)
+
+    return count
+
+
+# ==========================
+# SMART SCHEDULER
+# ==========================
+
+@tasks.loop(seconds=60)
+async def settlement_scheduler():
+    """
+    Runs once a minute, but only triggers a scan when
+    CURRENT_INTERVAL_MINUTES has passed since last_scan_time.
+    Interval adjusts based on whether new settlements were found.
+    """
+    global last_scan_time, CURRENT_INTERVAL_MINUTES
+
+    await bot.wait_until_ready()
+
+    now = datetime.utcnow()
+    if last_scan_time is None:
+        # First run after startup
+        print(f"[OCA] First scheduled scan starting (interval {CURRENT_INTERVAL_MINUTES} min)")
+        new_count = await run_settlement_scan()
+        last_scan_time = datetime.utcnow()
+
+        if new_count == 0:
+            CURRENT_INTERVAL_MINUTES = min(MAX_INTERVAL_MINUTES, CURRENT_INTERVAL_MINUTES * 2)
+        else:
+            CURRENT_INTERVAL_MINUTES = BASE_INTERVAL_MINUTES
+
+        print(f"[OCA] Next scheduled scan in {CURRENT_INTERVAL_MINUTES} minutes")
+        return
+
+    # Check if it's time to scan again
+    if now - last_scan_time < timedelta(minutes=CURRENT_INTERVAL_MINUTES):
+        return
+
+    print(f"[OCA] Scheduled scan triggered (interval {CURRENT_INTERVAL_MINUTES} min)")
+    new_count = await run_settlement_scan()
+    last_scan_time = datetime.utcnow()
+
+    if new_count == 0:
+        CURRENT_INTERVAL_MINUTES = min(MAX_INTERVAL_MINUTES, CURRENT_INTERVAL_MINUTES * 2)
+    else:
+        CURRENT_INTERVAL_MINUTES = BASE_INTERVAL_MINUTES
+
+    print(f"[OCA] Scan complete; new_count={new_count}. Next scan in {CURRENT_INTERVAL_MINUTES} minutes")
 
 
 # ==========================
@@ -501,25 +601,81 @@ async def check_settlements():
 async def on_ready():
     print(f"[OCA] Logged in as {bot.user}")
     load_seen_ids()
-    if not check_settlements.is_running():
-        check_settlements.start()
+    if not settlement_scheduler.is_running():
+        settlement_scheduler.start()
 
 
 @bot.command(name="oca_test")
 async def oca_test(ctx: commands.Context):
-    await ctx.send("FH Settlements Bot is online!")
+    """Simple check to ensure the bot responds and embeds work."""
+    await ctx.send("FH Settlements Bot is online and ready!")
 
     dummy = {
         "id": "dummy",
         "title": "Example Settlement",
         "reward": "$10 – $100 (example)",
         "deadline": "January 1, 2026",
-        "summary": "This is a test settlement to confirm embed formatting.",
+        "summary": "This is a test settlement to confirm embed formatting in this channel.",
         "proof": "Yes, proof is required.",
         "claim_url": "https://example.com/claim",
     }
 
     await send_settlement_embed(ctx.channel, dummy)
+
+
+@bot.command(name="oca_next")
+@commands.has_permissions(manage_guild=True)
+async def oca_next(ctx: commands.Context):
+    """
+    Manually trigger a scan & post new settlements in this channel.
+    Does not affect the smart scheduler interval.
+    Admin (Manage Server) only.
+    """
+    await ctx.send("🔎 Checking for new settlements now...")
+    new_count = await run_settlement_scan(target_channel=ctx.channel)
+
+    if new_count == 0:
+        await ctx.send("No new settlements found.")
+    else:
+        await ctx.send(f"Posted {new_count} new settlement(s).")
+
+
+@oca_next.error
+async def oca_next_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need `Manage Server` permissions to use this command.")
+
+
+@bot.command(name="oca_info")
+@commands.has_permissions(manage_guild=True)
+async def oca_info(ctx: commands.Context):
+    """
+    Show internal status:
+    - seen count
+    - current smart interval
+    - last scan time
+    - index URL
+    """
+    global last_scan_time, CURRENT_INTERVAL_MINUTES
+
+    seen_count = len(seen_ids)
+    last_scan_str = last_scan_time.isoformat(timespec="seconds") + " UTC" if last_scan_time else "Never"
+    msg = (
+        f"**FH Settlements Bot Info**\n"
+        f"- Seen settlements: `{seen_count}`\n"
+        f"- Current scan interval: `{CURRENT_INTERVAL_MINUTES}` minutes\n"
+        f"- Last scheduled scan: `{last_scan_str}`\n"
+        f"- Index source (scraped): `{SETTLEMENTS_INDEX_URL}`\n"
+        f"- Posts per scan (max): `{MAX_POSTS_PER_RUN}`\n"
+        f"- Delay between posts: `{POST_INTERVAL_SECONDS}` seconds"
+    )
+    await ctx.send(msg)
+
+
+@oca_info.error
+async def oca_info_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need `Manage Server` permissions to use this command.")
 
 
 # ==========================
