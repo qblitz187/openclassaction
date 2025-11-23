@@ -26,7 +26,7 @@ CHECK_INTERVAL_MINUTES = 60  # every 60 minutes
 # How long to wait between posting individual settlements
 POST_INTERVAL_SECONDS = 10  # 10 seconds between posts
 
-# Hard cap on how many NEW settlements to post per run (protects from spam)
+# Hard cap on how many NEW settlements to post per run
 MAX_POSTS_PER_RUN = 30
 
 # HTTP headers to look more like a normal browser
@@ -57,12 +57,10 @@ try:
 except ValueError:
     raise SystemExit("ERROR: DISCORD_CHANNEL_ID_OPENCLASS must be an integer.")
 
-# Intents
+# Intents – keep it simple: only ask for message_content (for !oca_test).
+# Make sure "Message Content Intent" is enabled in the Developer Portal.
 intents = discord.Intents.default()
-# Good practice for command bots:
 intents.message_content = True
-intents.members = True
-intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -92,7 +90,7 @@ def load_seen_ids() -> None:
 
 
 def save_seen_ids() -> None:
-    """Persist the seen IDs to disk (Railway volume or ephemeral fs)."""
+    """Persist the seen IDs to disk."""
     try:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump({"seen_ids": sorted(list(seen_ids))}, f, indent=2)
@@ -124,7 +122,7 @@ def fetch_settlement_links() -> List[str]:
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    links = []
+    links: List[str] = []
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -141,7 +139,7 @@ def fetch_settlement_links() -> List[str]:
 def fetch_settlement_details(url: str) -> Dict:
     """
     Given a single settlement URL, fetch useful details for the embed.
-    We keep this fairly defensive so if one page is weird, it doesn't kill the loop.
+    Defensive so one bad page doesn't kill the loop.
     """
     print(f"[OCA] Fetching settlement page: {url}")
 
@@ -203,7 +201,7 @@ def fetch_settlement_details(url: str) -> Dict:
         if not txt:
             continue
 
-        # Skip the usual disclaimer text blocks they use on many pages
+        # Skip boilerplate disclaimer chunks they repeat
         if "OpenClassActions.com is a news site providing information" in txt:
             continue
         if "Class action claims are submitted under penalty of perjury" in txt:
@@ -225,7 +223,7 @@ def fetch_settlement_details(url: str) -> Dict:
 async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) -> None:
     """
     Build and send a Discord embed for a single settlement.
-    Includes your legal/ethical disclaimer and NO explicit source branding.
+    Includes your disclaimer and no source branding.
     """
     title = data.get("title") or "Class Action Settlement"
     url = data.get("url")
@@ -233,7 +231,7 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
     deadline = data.get("deadline")
     summary = data.get("summary")
 
-    description_lines = []
+    description_lines: List[str] = []
 
     if summary:
         # Limit length so it doesn't get insane
@@ -241,7 +239,7 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
             summary = summary[:497] + "..."
         description_lines.append(summary)
 
-    # Your disclaimer (what you asked for)
+    # Your disclaimer
     disclaimer = (
         "⚠️ Apply for these at your own risk, and only if you were "
         "actually and legally affected by the issue. Do not submit false claims."
@@ -266,8 +264,6 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
         embed.add_field(name="Deadline", value=deadline, inline=False)
 
     # No explicit source footer
-    # embed.set_footer(text="Source: OpenClassActions.com")
-
     await channel.send(embed=embed)
 
 
