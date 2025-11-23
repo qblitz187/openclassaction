@@ -12,6 +12,7 @@ from urllib.parse import urljoin
 
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 from dotenv import load_dotenv
 
 # ==========================
@@ -55,7 +56,7 @@ except ValueError:
     raise SystemExit("ERROR: DISCORD_CHANNEL_ID_OPENCLASS must be an integer")
 
 intents = discord.Intents.default()
-intents.message_content = True  # for !oca_test, !oca_next, !oca_info
+intents.message_content = True  # for legacy text commands
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -272,7 +273,7 @@ def fetch_settlement_details(url: str) -> Dict:
 
     # We'll collect proof candidates here
     proof_same_line_candidates: List[str] = []  # "Proof required: No"
-    proof_heading_tags: List[BeautifulSoup] = []  # tags like "Proof Required?"
+    proof_heading_tags: List[object] = []      # tags like "Proof Required?"
 
     # --------------------------
     # Reward / Deadline / Proof (first pass)
@@ -564,7 +565,6 @@ async def settlement_scheduler():
 
     now = datetime.utcnow()
     if last_scan_time is None:
-        # First run after startup
         print(f"[OCA] First scheduled scan starting (interval {CURRENT_INTERVAL_MINUTES} min)")
         new_count = await run_settlement_scan()
         last_scan_time = datetime.utcnow()
@@ -594,16 +594,32 @@ async def settlement_scheduler():
 
 
 # ==========================
-# EVENTS & COMMANDS
+# EVENTS
 # ==========================
 
 @bot.event
 async def on_ready():
+    global last_scan_time
     print(f"[OCA] Logged in as {bot.user}")
     load_seen_ids()
+
     if not settlement_scheduler.is_running():
         settlement_scheduler.start()
 
+    # Sync slash commands
+    try:
+        synced = await bot.tree.sync()
+        print(f"[OCA] Synced {len(synced)} slash command(s).")
+    except Exception as e:
+        print(f"[OCA] Failed to sync slash commands: {e}")
+
+    if last_scan_time is None:
+        last_scan_time = None  # explicitly mark as not run yet
+
+
+# ==========================
+# LEGACY TEXT COMMANDS (!)
+# ==========================
 
 @bot.command(name="oca_test")
 async def oca_test(ctx: commands.Context):
@@ -676,6 +692,89 @@ async def oca_info(ctx: commands.Context):
 async def oca_info_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("You need `Manage Server` permissions to use this command.")
+
+
+# ==========================
+# SLASH COMMANDS (/)
+# ==========================
+
+@bot.tree.command(name="oca_test", description="Check that the FH Settlements Bot is online.")
+async def slash_oca_test(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "FH Settlements Bot is online and ready! Posting a sample settlement embed here...",
+        ephemeral=True,
+    )
+
+    dummy = {
+        "id": "dummy",
+        "title": "Example Settlement",
+        "reward": "$10 – $100 (example)",
+        "deadline": "January 1, 2026",
+        "summary": "This is a test settlement to confirm embed formatting in this channel.",
+        "proof": "Yes, proof is required.",
+        "claim_url": "https://example.com/claim",
+    }
+
+    # Post the embed to the same channel (public), message to user is ephemeral
+    if interaction.channel:
+        await send_settlement_embed(interaction.channel, dummy)
+
+
+@bot.tree.command(name="oca_next", description="Manually scan and post new settlements in this channel.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def slash_oca_next(interaction: discord.Interaction):
+    if interaction.channel is None:
+        await interaction.response.send_message(
+            "This command must be used in a server text channel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    new_count = await run_settlement_scan(target_channel=interaction.channel)
+
+    if new_count == 0:
+        await interaction.followup.send("No new settlements found.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"Posted {new_count} new settlement(s).", ephemeral=True)
+
+
+@slash_oca_next.error
+async def slash_oca_next_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "You need `Manage Server` permissions to use this command.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="oca_info", description="Show internal info about the FH Settlements Bot.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def slash_oca_info(interaction: discord.Interaction):
+    global last_scan_time, CURRENT_INTERVAL_MINUTES
+
+    seen_count = len(seen_ids)
+    last_scan_str = last_scan_time.isoformat(timespec="seconds") + " UTC" if last_scan_time else "Never"
+    msg = (
+        f"**FH Settlements Bot Info**\n"
+        f"- Seen settlements: `{seen_count}`\n"
+        f"- Current scan interval: `{CURRENT_INTERVAL_MINUTES}` minutes\n"
+        f"- Last scheduled scan: `{last_scan_str}`\n"
+        f"- Index source (scraped): `{SETTLEMENTS_INDEX_URL}`\n"
+        f"- Posts per scan (max): `{MAX_POSTS_PER_RUN}`\n"
+        f"- Delay between posts: `{POST_INTERVAL_SECONDS}` seconds"
+    )
+
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@slash_oca_info.error
+async def slash_oca_info_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "You need `Manage Server` permissions to use this command.",
+            ephemeral=True,
+        )
 
 
 # ==========================
