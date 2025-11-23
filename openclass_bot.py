@@ -117,6 +117,21 @@ def fetch_settlement_links() -> List[str]:
     return links
 
 
+def normalize_proof_answer(text: str) -> str:
+    """Normalize proof answer text into friendly Yes/No/Maybe sentences."""
+    low = text.lower().strip()
+    if any(kw in low for kw in ["not required", "none required", "no proof"]):
+        return "No, proof is not required."
+    if low in ("no", "none"):
+        return "No, proof is not required."
+    if "may be required" in low:
+        return "Proof may be required."
+    if "required" in low or low in ("yes", "y"):
+        return "Yes, proof is required."
+    # Fallback raw
+    return text.strip()
+
+
 def fetch_settlement_details(url: str) -> Dict:
     """
     Scrape a single settlement page:
@@ -161,11 +176,12 @@ def fetch_settlement_details(url: str) -> Dict:
 
     reward = None
     deadline = None
-    proof_raw = None
+    proof_value_on_same_line = None  # e.g. "Proof of Purchase: Required"
+    proof_heading_tag = None         # e.g. "Proof Required?"
     claim_url = None
 
     # --------------------------
-    # Reward / Deadline / Proof
+    # Reward / Deadline / Proof (first pass)
     # --------------------------
     for tag in soup.find_all(["h2", "h3", "h4", "strong", "p", "li"]):
         text_full = tag.get_text(" ", strip=True)
@@ -196,9 +212,15 @@ def fetch_settlement_details(url: str) -> Dict:
             parts = text_full.split(":", 1)
             deadline = parts[1].strip() if len(parts) > 1 else text_full.strip()
 
-        # Proof required line
-        if proof_raw is None and "proof" in lower:
-            proof_raw = text_full
+        # Proof detection:
+        if "proof" in lower:
+            # Pattern like: "Proof of Purchase: Required / Not Required"
+            if ":" in text_full and proof_value_on_same_line is None:
+                label, value = text_full.split(":", 1)
+                proof_value_on_same_line = value.strip()
+            # Heading like "Proof Required?" or "Proof of Purchase"
+            if proof_heading_tag is None:
+                proof_heading_tag = tag
 
     # Fallback for reward: dollar amount line mentioning payout/award/cash/etc.
     if reward is None:
@@ -212,7 +234,7 @@ def fetch_settlement_details(url: str) -> Dict:
                 break
 
     # --------------------------
-    # Improved summary detection
+    # Summary detection
     # --------------------------
     summary = None
     backup_summary = None
@@ -259,19 +281,25 @@ def fetch_settlement_details(url: str) -> Dict:
         summary = backup_summary
 
     # --------------------------
-    # Improved proof normalization
+    # Proof normalization
     # --------------------------
     proof = None
-    if proof_raw:
-        low = proof_raw.lower()
-        if "not required" in low or "none required" in low:
-            proof = "No, proof is not required."
-        elif "may be required" in low:
-            proof = "Proof may be required."
-        elif "required" in low:
-            proof = "Yes, proof is required."
-        else:
-            proof = proof_raw
+
+    if proof_value_on_same_line:
+        # e.g. "Required", "Not Required", "None Required"
+        proof = normalize_proof_answer(proof_value_on_same_line)
+
+    elif proof_heading_tag is not None:
+        # Look at the next non-empty sibling after the heading
+        sib = proof_heading_tag.find_next_sibling()
+        while sib is not None and not sib.get_text(" ", strip=True):
+            sib = sib.find_next_sibling()
+
+        if sib is not None:
+            ans_text = sib.get_text(" ", strip=True)
+            proof = normalize_proof_answer(ans_text)
+
+    # If no structured info found, leave proof as None
 
     # --------------------------
     # Claim button URL
@@ -313,7 +341,6 @@ async def send_settlement_embed(channel: discord.abc.Messageable, data: Dict) ->
     summary = data.get("summary")
     proof = data.get("proof")
 
-    # Title links ONLY to claim URL. If none, it's just plain text.
     primary_link = claim_url if claim_url else None
 
     description_lines: List[str] = []
