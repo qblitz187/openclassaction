@@ -66,6 +66,9 @@ seen_ids = set()
 CURRENT_INTERVAL_MINUTES = BASE_INTERVAL_MINUTES
 last_scan_time: Optional[datetime] = None
 
+# Global toggle for auto-posting
+AUTO_POSTING_ENABLED = True
+
 # ==========================
 # SEEN IDS
 # ==========================
@@ -558,10 +561,15 @@ async def settlement_scheduler():
     Runs once a minute, but only triggers a scan when
     CURRENT_INTERVAL_MINUTES has passed since last_scan_time.
     Interval adjusts based on whether new settlements were found.
+    Respects AUTO_POSTING_ENABLED.
     """
-    global last_scan_time, CURRENT_INTERVAL_MINUTES
+    global last_scan_time, CURRENT_INTERVAL_MINUTES, AUTO_POSTING_ENABLED
 
     await bot.wait_until_ready()
+
+    # If auto-posting is disabled, do nothing
+    if not AUTO_POSTING_ENABLED:
+        return
 
     now = datetime.utcnow()
     if last_scan_time is None:
@@ -671,16 +679,19 @@ async def oca_info(ctx: commands.Context):
     - current smart interval
     - last scan time
     - index URL
+    - auto-posting state
     """
-    global last_scan_time, CURRENT_INTERVAL_MINUTES
+    global last_scan_time, CURRENT_INTERVAL_MINUTES, AUTO_POSTING_ENABLED
 
     seen_count = len(seen_ids)
     last_scan_str = last_scan_time.isoformat(timespec="seconds") + " UTC" if last_scan_time else "Never"
+    auto_state = "Enabled" if AUTO_POSTING_ENABLED else "Disabled"
     msg = (
         f"**FH Settlements Bot Info**\n"
         f"- Seen settlements: `{seen_count}`\n"
         f"- Current scan interval: `{CURRENT_INTERVAL_MINUTES}` minutes\n"
         f"- Last scheduled scan: `{last_scan_str}`\n"
+        f"- Auto-posting: `{auto_state}`\n"
         f"- Index source (scraped): `{SETTLEMENTS_INDEX_URL}`\n"
         f"- Posts per scan (max): `{MAX_POSTS_PER_RUN}`\n"
         f"- Delay between posts: `{POST_INTERVAL_SECONDS}` seconds"
@@ -690,6 +701,36 @@ async def oca_info(ctx: commands.Context):
 
 @oca_info.error
 async def oca_info_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need `Manage Server` permissions to use this command.")
+
+
+@bot.command(name="oca_stop")
+@commands.has_permissions(manage_guild=True)
+async def oca_stop(ctx: commands.Context):
+    """Stop automatic settlement posting (scheduler stays running but idle)."""
+    global AUTO_POSTING_ENABLED
+    AUTO_POSTING_ENABLED = False
+    await ctx.send("🛑 Automatic settlement posting has been **stopped**.")
+
+
+@oca_stop.error
+async def oca_stop_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need `Manage Server` permissions to use this command.")
+
+
+@bot.command(name="oca_start")
+@commands.has_permissions(manage_guild=True)
+async def oca_start(ctx: commands.Context):
+    """Resume automatic settlement posting."""
+    global AUTO_POSTING_ENABLED
+    AUTO_POSTING_ENABLED = True
+    await ctx.send("▶️ Automatic settlement posting has been **resumed**.")
+
+
+@oca_start.error
+async def oca_start_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("You need `Manage Server` permissions to use this command.")
 
@@ -715,7 +756,6 @@ async def slash_oca_test(interaction: discord.Interaction):
         "claim_url": "https://example.com/claim",
     }
 
-    # Post the embed to the same channel (public), message to user is ephemeral
     if interaction.channel:
         await send_settlement_embed(interaction.channel, dummy)
 
@@ -751,15 +791,17 @@ async def slash_oca_next_error(interaction: discord.Interaction, error: app_comm
 @bot.tree.command(name="oca_info", description="Show internal info about the FH Settlements Bot.")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def slash_oca_info(interaction: discord.Interaction):
-    global last_scan_time, CURRENT_INTERVAL_MINUTES
+    global last_scan_time, CURRENT_INTERVAL_MINUTES, AUTO_POSTING_ENABLED
 
     seen_count = len(seen_ids)
     last_scan_str = last_scan_time.isoformat(timespec="seconds") + " UTC" if last_scan_time else "Never"
+    auto_state = "Enabled" if AUTO_POSTING_ENABLED else "Disabled"
     msg = (
         f"**FH Settlements Bot Info**\n"
         f"- Seen settlements: `{seen_count}`\n"
         f"- Current scan interval: `{CURRENT_INTERVAL_MINUTES}` minutes\n"
         f"- Last scheduled scan: `{last_scan_str}`\n"
+        f"- Auto-posting: `{auto_state}`\n"
         f"- Index source (scraped): `{SETTLEMENTS_INDEX_URL}`\n"
         f"- Posts per scan (max): `{MAX_POSTS_PER_RUN}`\n"
         f"- Delay between posts: `{POST_INTERVAL_SECONDS}` seconds"
@@ -770,6 +812,49 @@ async def slash_oca_info(interaction: discord.Interaction):
 
 @slash_oca_info.error
 async def slash_oca_info_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "You need `Manage Server` permissions to use this command.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="oca_stop", description="Stop automatic settlement posting.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def slash_oca_stop(interaction: discord.Interaction):
+    global AUTO_POSTING_ENABLED
+    AUTO_POSTING_ENABLED = False
+
+    await interaction.response.send_message(
+        "🛑 Automatic settlement posting has been **stopped**.\n"
+        "You can start it again anytime with `/oca_start`.",
+        ephemeral=True,
+    )
+
+
+@slash_oca_stop.error
+async def slash_oca_stop_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "You need `Manage Server` permissions to use this command.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="oca_start", description="Resume automatic settlement posting.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def slash_oca_start(interaction: discord.Interaction):
+    global AUTO_POSTING_ENABLED
+    AUTO_POSTING_ENABLED = True
+
+    await interaction.response.send_message(
+        "▶️ Automatic settlement posting has been **resumed**.",
+        ephemeral=True,
+    )
+
+
+@slash_oca_start.error
+async def slash_oca_start_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
             "You need `Manage Server` permissions to use this command.",
